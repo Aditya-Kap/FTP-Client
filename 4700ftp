@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import socket
+import sys
+from urllib.parse import urlparse, unquote
+
+
+# FTP Client for Project 2
+# The FTP protocol is implimented by hand without the use of any built-in FTP libraries.
+
+DEFAULT_PORT = 21
+DEFAULT_USER = "anonymous"
+BUFFER_SIZE = 4096
+TIMEOUT = 30         #Timeout for socket operations in seconds
+
+PASV_RE = re.compile(r"\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)")
+
+class FTPError(Exception):
+    """Unexpected reply"""
+
+class UsageError(Exception):
+    """Invalid usage"""
+
+# The parts of an URL
+class FTPURL:
+    def __init__(self, user, password, host, port, path):
+        self.user = user
+        self.password = password
+        self.host = host
+        self.port = port
+        self.path = path
+
+# Check if it's an FTP url and not a local path.
+def is_ftp_url(text):
+    return text.lower().startswith("ftp://")
+
+# Split the FTP url into user, password, host,port, and path
+# urlparse leves %-escapes in place so decoding them is necessary.
+def parse_ftp_url(url):
+    parsed = urlparse(url)
+
+    if parsed.scheme.lower() != "ftp":
+        raise UsageError("Not an FTP URL")
+    if not parsed.hostname:
+        raise UsageError("Missing host in FTP URL")
+    try:
+        port = parsed.port or DEFAULT_PORT
+    except ValueError:
+        raise UsageError("Invalid port in FTP URL")
+
+    user = unquote(parsed.username) if parsed.username else DEFAULT_USER
+    password = unquote(parsed.password) if parsed.password is not None else ""
+    path = unquote(parsed.path) or "/"
+    return FTPURL(user, password, parsed.hostname, port, path)
+
+# FTP Protocol Implementation
+class FTPClient:
+    def __init__(self, host, port, verbose=False):
+        self.host = host
+        self.port = port
+        self.verbose = verbose
+        self.ctrl = None            #control socket
+        self.ctrl_in = None         #Buffer reader for control socket
+
+    #Loggin
+    def _log(self, prefix, text):
+        if self.verbose:
+            print(f"{prefix}: {text}", file = sys.stderr)
+
+    #Reading replys
+    def _readline(self):
+        raw = self.ctrl_in.readline()
+        if not raw:
+            raise FTPError("Control connection closed")
+        return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+    
+    #Read a complete reply and return
+    #For example a single line reply : "220 Transfer complete"
+    def read_response(self):
+        first = self._readline()
+        self._log("<--", first)
+        if len(first) < 3 or not first[:3].isdigit():
+            raise FTPError(f"incorrect reply from server: {first!r}")
+
+        lines = [first]
+        if len(first) > 3 and first[3] == "-":
+            terminator = first[:3] + " "
+            while True:
+                line = self._readline()
+                self._log("<--", line)
+                lines.append(line)
+                if line.startswith(terminator):
+                    break
+        return int(first[:3]), "\n".join(lines)
+
+    #Sending commands
+    #Send one command terminated by CRLF
+    def send_command(self, command):
+        shown = "PASS ****" if command.startswith("PASS") else command
+        self._log("-->", shown)
+        self.ctrl.sendall((command + "\r\n").encode("utf-8"))
+
+    #Send a command, read its reply, and check the reply's first digit
+    def command(self, command, expected=(2,)):
+        self.send_command(command)
+        code, text = self.read_response()
+        if code // 100 not in expected:
+            raise FTPError(f"{command.split()[0]} failed: {text}")
+        return code, text
+
+    #Open the control channel and read the server's hello message
+    #Reading the hello before sending anything avoids a race condition
+    def connect(self):
+        self.ctrl = socket.create_connection((self.host, self.port), timeout=TIMEOUT)
+        self.ctrl_in = self.ctrl.makefile("rb")
+        code, text = self.read_response()
+        while code // 100 == 1:
+            code, text = self.read_response()
+        if code // 100 != 2:
+            raise FTPError(f"server refused connection: {text}")
+
+    #User than pass if the server asks for one.
+    def login(self, user, password):
+        code, _ = self.command(f"USER {user}", expected=(2, 3))
+        if code // 100 == 3:
+            self.command(f"PASS {password or ''}")
+    
+    #Requireed before any upload or download
+    def set_binary_stream_mode(self):
+        self.command("TYPE I")
+        self.command("MODE S")
+        self.command("STRU F")
+
+    #Ending the session and closing the control secket
+    def quit(self):
+        if self.ctrl is None:
+            return
+        try:
+            self.command("QUIT")
+        except (OSError, FTPError):
+            pass 
+        finally:
+            try:
+                self.ctrl_in.close()
+                self.ctrl.close()
+            except OSError:
+                pass
+            self.ctrl = None
+            self.ctrl_in = None
+    
+    #Send PASV, parse the adress from reply and connect to it
+    def open_data_channel(self):
+        _, text = self.command("PASV")
+        match = PASV_RE.search(text)
+        if not match:
+            raise FTPError(f"could not parse PASV reply")
+        nums = [int(n) for n in match.groups()]
+        ip = ".".join(str(n) for n in nums[:4])
+        port = (nums[4] << 8) + nums[5]
+        if ip == "0.0.0.0":
+            ip = self.host
+        self._log("---", f"opening data channel to {ip}:{port}")
+        return socket.create_connection((ip, port), timeout=TIMEOUT)
+
+    #Send LIST/RETR/STOR, the server must answerbefore data flows.
+    #Any errors will be raised here.
+    def _start_transfer(self, command):
+        self.send_command(command)
+        code, text = self.read_response()
+        if code // 100 != 1:
+            raise FTPError(f"{command.split()[0]} failed: {text}")
+    
+    #after the data channel closes the server sends a final 2xx reply
+    def _finish_transfer(self):
+        code, text = self.read_response()
+        if code // 100 != 2:
+            raise FTPError(f"transfer failed: {text}")
+    
+    #read from the data channel untill the server closes it.
+    @staticmethod
+    def _recv_all(data_sock, sink):
+        while True:
+            chunk = data_sock.recv(BUFFER_SIZE)
+            if not chunk:
+                break
+            sink(chunk)
+    
+    #List: the listing comes back over the data channel.
+    def list_dir(self, path):
+        chunks = []
+        data = self.open_data_channel()
+        try:
+            self._start_transfer(f"LIST {path}")
+            self._recv_all(data, chunks.append)
+        finally:
+            data.close()
+        self._finish_transfer()
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    
+    #RETR: server sends the file over the data channel and closes it.
+    #Only create the local file once the server agrees to send it.
+    def download(self, remote_path, local_path):
+        created = False
+        data = self.open_data_channel()
+        try:
+            self._start_transfer(f"RETR {remote_path}")
+            with open(local_path, "wb") as f:
+                created = True
+                self._recv_all(data, f.write)
+            data.close()
+            self._finish_transfer()
+        except BaseException:
+            data.close()
+            if created and os.path.exists(local_path):
+                os.remove(local_path)
+            raise
+        
+    #STOR: we send the file and close the data channel
+    #So the serveer knows the upload is finished
+    def upload(self, local_path, remote_path):
+        with open(local_path, "rb") as f:
+            data = self.open_data_channel()
+            try:
+                self._start_transfer(f"STOR {remote_path}")
+                while True:
+                    chunk = f.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    data.sendall(chunk)
+                data.shutdown(socket.SHUT_WR)
+            finally:
+                data.close()
+        self._finish_transfer()
+    
+    def make_dir(self, path):
+        self.command(f"MKD {path}")
+
+    def remove_dir(self, path):
+        self.command(f"RMD {path}")
+
+    def delete_file(self, path):
+        self.command(f"DELE {path}")
+        
+# Connect, login and set binary/stream/file mode.
+def open_session(url, verbose):
+    client = FTPClient(url.host, url.port, verbose)
+    try:
+        client.connect()
+        client.login(url.user, url.password)
+        client.set_binary_stream_mode()
+    except BaseException:
+        client.quit()
+        raise
+    return client
+    
+# Command lie handling
+SINGLE_URL_OPS = ("ls", "mkdir", "rm", "rmdir")
+TRANSFER_OPS = ("cp", "mv")
+
+def run(operation, params, verbose):
+    operation = operation.lower()
+
+    if operation in SINGLE_URL_OPS:
+        if len(params) != 1:
+            raise UsageError(f"'{operation}' takes only one URL")
+        if not is_ftp_url(params[0]):
+            raise UsageError(f"'{operation}' needs an ftp:// URL")
+        url = parse_ftp_url(params[0])
+        client = open_session(url, verbose)
+        try:
+            if operation == "ls":
+                listing = client.list_dir(url.path)
+                sys.stdout.write(listing.replace("\r\n", "\n"))
+            elif operation == "mkdir":
+                client.make_dir(url.path)
+            elif operation == "rm":
+                client.delete_file(url.path)
+            elif operation == "rmdir":
+                client.remove_dir(url.path)
+        finally:
+            client.quit()
+
+    elif operation in TRANSFER_OPS:
+        if len(params) != 2:
+            raise UsageError(f"'{operation}' takes two arguments")
+        src, dst = params
+        src_remote, dst_remote = is_ftp_url(src), is_ftp_url(dst)
+        if src_remote == dst_remote:
+            raise UsageError("only one of ARG1 and ARG2 must be an ftp:// URL")
+
+        # Download: remote -> local
+        if src_remote:
+            url = parse_ftp_url(src)
+            client = open_session(url, verbose)
+            try:
+                client.download(url.path, dst)
+                if operation == "mv":
+                    client.delete_file(url.path)
+            finally:
+                client.quit()
+        # Upload: local -> remote
+        else:
+            if not os.path.isfile(src):
+                raise UsageError(f"local file not found: {src}")
+            url = parse_ftp_url(dst)
+            client = open_session(url, verbose)
+            try:
+                client.upload(src, url.path)
+            finally:
+                client.quit()
+            if operation == "mv":
+                os.remove(src)
+
+    else:
+        raise UsageError(
+            f"unknown operation '{operation}'; "
+            f"valid operations are {', '.join(SINGLE_URL_OPS + TRANSFER_OPS)}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="4700ftp",
+        description="FTP client to do various tasks such as listing, copying, moving"
+                    "and deleting files on a remote FTP server.")
+    parser.add_argument("operation", help="ls, mkdir, rm, rmdir, cp, or mv")
+    parser.add_argument("params", nargs="+", help="one or two local paths and/or ftp:// URLs")
+    parser.add_argument("--verbose", "-v", action="store_true", help="print all messages to and from the FTP server")
+    args = parser.parse_args()
+    
+    try:
+        run(args.operation, args.params, args.verbose)
+    except UsageError as e:
+        print(f"usage error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except FTPError as e:
+        print(f"FTP error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+        
+if __name__ == "__main__":
+    main()
